@@ -3,6 +3,17 @@ let port = null;
 let audioQueue = [];
 let isConnecting = false;
 
+// Convert Uint8Array to base64
+function arrayBufferToBase64(buffer) {
+  let binary = '';
+  const bytes = new Uint8Array(buffer);
+  const len = bytes.byteLength;
+  for (let i = 0; i < len; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
 chrome.runtime.onConnect.addListener((p) => {
   console.log('🔌 Popup connected');
   port = p;
@@ -15,26 +26,32 @@ chrome.runtime.onConnect.addListener((p) => {
     } else if (msg.type === 'DISCONNECT') {
       disconnectWebSocket();
     } else if (msg.type === 'AUDIO') {
-      // Handle ArrayBuffer from Chrome extension
       const data = msg.data;
-      console.log('Audio data type:', typeof data, 'Length:', data?.length || data?.byteLength);
+      console.log('Audio data type:', typeof data, 'Length:', data?.length);
       
-      if (!data) {
-        console.error('❌ No audio data received');
+      if (!data || !Array.isArray(data)) {
+        console.error('❌ No audio data');
         return;
       }
       
-      // Convert to Uint8Array if needed
-      let buffer;
-      if (data instanceof ArrayBuffer) {
-        buffer = new Uint8Array(data);
-      } else if (Array.isArray(data)) {
-        buffer = new Uint8Array(data);
-      } else {
-        buffer = data;
+      // Convert int16 array to binary
+      const buffer = new ArrayBuffer(data.length * 2);
+      const view = new DataView(buffer);
+      for (let i = 0; i < data.length; i++) {
+        view.setInt16(i * 2, data[i], true);
       }
       
-      sendAudio(buffer);
+      // Convert to base64
+      const base64 = arrayBufferToBase64(buffer);
+      console.log('📦 Converted to base64, length:', base64.length);
+      
+      // Send as JSON text
+      const message = JSON.stringify({
+        type: 'AUDIO',
+        data: base64
+      });
+      
+      sendMessage(message);
     }
   });
   
@@ -45,8 +62,14 @@ chrome.runtime.onConnect.addListener((p) => {
 });
 
 function connectWebSocket() {
-  if (ws?.readyState === WebSocket.OPEN || isConnecting) {
-    console.log('Already connected or connecting');
+  if (ws?.readyState === WebSocket.OPEN) {
+    console.log('Already connected');
+    port?.postMessage({ type: 'CONNECTED' });
+    return;
+  }
+  
+  if (isConnecting) {
+    console.log('Already connecting...');
     return;
   }
   
@@ -60,10 +83,10 @@ function connectWebSocket() {
     isConnecting = false;
     port?.postMessage({ type: 'CONNECTED' });
     
-    // Send any queued audio
+    // Send queued messages
     while (audioQueue.length > 0) {
-      const data = audioQueue.shift();
-      ws.send(data);
+      const msg = audioQueue.shift();
+      ws.send(msg);
     }
   };
   
@@ -78,35 +101,37 @@ function connectWebSocket() {
     port?.postMessage({ type: 'ERROR', error: 'Connection failed' });
   };
   
-  ws.onclose = (event) => {
-    console.log('🔒 WebSocket closed. Code:', event.code, 'Reason:', event.reason);
+  ws.onclose = () => {
+    console.log('🔒 WebSocket closed');
     isConnecting = false;
     ws = null;
     port?.postMessage({ type: 'DISCONNECTED' });
   };
 }
 
-function sendAudio(data) {
+function sendMessage(message) {
   if (!ws) {
-    console.log('⏳ WebSocket not ready, queueing audio');
-    audioQueue.push(data);
+    console.log('⏳ WebSocket not ready, queueing');
+    audioQueue.push(message);
     return;
   }
   
   if (ws.readyState === WebSocket.OPEN) {
-    console.log('📤 Sending audio, bytes:', data.byteLength || data.length);
-    ws.send(data);
+    console.log('📤 Sending message, length:', message.length);
+    ws.send(message);
   } else if (ws.readyState === WebSocket.CONNECTING) {
-    console.log('⏳ WebSocket connecting, queueing audio');
-    audioQueue.push(data);
+    console.log('⏳ WebSocket connecting, queueing');
+    audioQueue.push(message);
   } else {
     console.error('❌ WebSocket not open, state:', ws.readyState);
-    audioQueue.push(data);
   }
 }
 
 function disconnectWebSocket() {
+  console.log('🔌 Disconnecting...');
   audioQueue = [];
-  ws?.close();
-  ws = null;
+  if (ws) {
+    ws.close();
+    ws = null;
+  }
 }
