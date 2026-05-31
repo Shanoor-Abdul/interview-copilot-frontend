@@ -8,7 +8,7 @@ export default function App() {
   const [error, setError] = useState(null);
   
   const pendingQuestion = useRef(null);
-  const ws = useRef(null);
+  const portRef = useRef(null);
   const audioCtx = useRef(null);
   const processor = useRef(null);
   const stream = useRef(null);
@@ -20,122 +20,163 @@ export default function App() {
 
   useEffect(() => () => stop(), []);
 
+  useEffect(() => {
+    const setupPort = () => {
+      const port = chrome.runtime.connect({ name: 'interview-copilot' });
+      portRef.current = port;
+      
+      port.onMessage.addListener((msg) => {
+        console.log('Popup received:', msg);
+        
+        if (msg.type === 'CONNECTED') {
+          console.log('Connected to backend');
+        } else if (msg.type === 'MESSAGE') {
+          handleMessage(msg.data);
+        } else if (msg.type === 'ERROR') {
+          setError('Connection error: ' + msg.error);
+          stop();
+        } else if (msg.type === 'DISCONNECTED') {
+          setRecording(false);
+        }
+      });
+      
+      port.onDisconnect.addListener(() => {
+        console.log('Port disconnected');
+        portRef.current = null;
+      });
+    };
+    
+    setupPort();
+    
+    return () => {
+      portRef.current?.disconnect();
+    };
+  }, []);
+
+  const handleMessage = (data) => {
+    if (data.startsWith('Q:')) {
+      const q = data.slice(2);
+      pendingQuestion.current = q;
+      setCurrentQ(q);
+      setCurrentA(null);
+    } else if (data.startsWith('A:')) {
+      const a = data.slice(2);
+      setCurrentA(a);
+      
+      const questionToStore = pendingQuestion.current || currentQ || "Unknown";
+      
+      setHistory(prev => {
+        const isDuplicate = prev.some(h => 
+          h.question === questionToStore && h.answer === a
+        );
+        if (!isDuplicate) {
+          return [...prev, {
+            question: questionToStore,
+            answer: a,
+            time: Date.now()
+          }];
+        }
+        return prev;
+      });
+      
+      pendingQuestion.current = null;
+    } else if (data.startsWith('ERROR:')) {
+      setError(data.replace('ERROR:', ''));
+    }
+  };
+
   const stop = () => {
     processor.current?.disconnect();
     audioCtx.current?.close();
     stream.current?.getTracks().forEach(t => t.stop());
-    ws.current?.close();
+    portRef.current?.postMessage({ type: 'DISCONNECT' });
     processor.current = null;
     audioCtx.current = null;
     stream.current = null;
-    ws.current = null;
     pendingQuestion.current = null;
     setRecording(false);
   };
 
-  const start = async () => {
-    setError(null);
-    pendingQuestion.current = null;
+ const start = async () => {
+  setError(null);
+  pendingQuestion.current = null;
+  
+  try {
+    console.log('🎬 Start clicked');
+    portRef.current?.postMessage({ type: 'CONNECT' });
     
-    try {
-      const socket = new WebSocket('ws://localhost:8000/ws');
+    // Get TAB audio (not microphone) - important for interviews
+    const s = await navigator.mediaDevices.getDisplayMedia({
+      video: true,
+      audio: {
+        echoCancellation: true,  // Enable for cleaner audio
+        noiseSuppression: true,   // Enable for cleaner audio
+        autoGainControl: true,    // Enable for consistent volume
+        sampleRate: 16000,        // Match backend expectation
+        channelCount: 1           // Mono is fine for speech
+      }
+    });
+    
+    if (s.getAudioTracks().length === 0) {
+      throw new Error('No audio! Check "Share audio" checkbox');
+    }
+    
+    stream.current = s;
+    
+    // Use lower sample rate for speech recognition
+    const ctx = new AudioContext({ sampleRate: 16000 });
+    audioCtx.current = ctx;
+    
+    const src = ctx.createMediaStreamSource(s);
+    
+    // Add a low-pass filter to reduce high-frequency noise
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.value = 4000; // Voice is mostly below 4kHz
+    
+    const proc = ctx.createScriptProcessor(4096, 1, 1);
+    
+    proc.onaudioprocess = (e) => {
+      if (!portRef.current) return;
       
-      socket.onmessage = (e) => {
-        const d = e.data;
-        
-        if (d.startsWith('Q:')) {
-          const q = d.slice(2);
-          pendingQuestion.current = q;
-          setCurrentQ(q);
-          setCurrentA(null);
-        } 
-        else if (d.startsWith('A:')) {
-          const a = d.slice(2);
-          setCurrentA(a);
-          
-          const questionToStore = pendingQuestion.current || currentQ || "Unknown";
-          
-          setHistory(prev => {
-            const isDuplicate = prev.some(h => 
-              h.question === questionToStore && h.answer === a
-            );
-            if (!isDuplicate) {
-              return [...prev, {
-                question: questionToStore,
-                answer: a,
-                time: Date.now()
-              }];
-            }
-            return prev;
-          });
-          
-          pendingQuestion.current = null;
-        } 
-        else if (d.startsWith('ERROR:')) {
-          setError(d.replace('ERROR:', ''));
-        }
-      };
+      const input = e.inputBuffer.getChannelData(0);
       
-      socket.onerror = () => {
-        setError('Connection failed');
-        stop();
-      };
-      
-      socket.onclose = () => stop();
-      
-      ws.current = socket;
-      
-      await new Promise((resolve, reject) => {
-        const timeout = setTimeout(() => reject('timeout'), 3000);
-        socket.onopen = () => {
-          clearTimeout(timeout);
-          resolve();
-        };
-      });
-      
-      const s = await navigator.mediaDevices.getDisplayMedia({
-        video: true,
-        audio: { echoCancellation: false, noiseSuppression: false }
-      });
-      
-      if (s.getAudioTracks().length === 0) {
-        throw new Error('No audio! Check "Share audio"');
+      // Simple noise gate - ignore very quiet audio
+      const maxAmp = Math.max(...input.map(Math.abs));
+      if (maxAmp < 0.01) {
+        return; // Too quiet, skip
       }
       
-      stream.current = s;
-      const ctx = new AudioContext({ sampleRate: 16000 });
-      audioCtx.current = ctx;
+      const pcm = new Int16Array(input.length);
+      for (let i = 0; i < input.length; i++) {
+        const s = Math.max(-1, Math.min(1, input[i]));
+        pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+      }
       
-      const src = ctx.createMediaStreamSource(s);
-      const proc = ctx.createScriptProcessor(4096, 1, 1);
-      
-      proc.onaudioprocess = (e) => {
-        if (ws.current?.readyState !== 1) return;
-        const input = e.inputBuffer.getChannelData(0);
-        const pcm = new Int16Array(input.length);
-        for (let i = 0; i < input.length; i++) {
-          const s = Math.max(-1, Math.min(1, input[i]));
-          pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-        }
-        ws.current.send(pcm.buffer);
-      };
-      
-      src.connect(proc);
-      proc.connect(ctx.destination);
-      processor.current = proc;
-      
-      s.getTracks().forEach(t => t.onended = stop);
-      setRecording(true);
-      
-    } catch (e) {
-      setError(e.message || 'Failed');
-      stop();
-    }
-  };
+      // Send as array
+      portRef.current.postMessage({ 
+        type: 'AUDIO', 
+        data: Array.from(pcm)
+      });
+    };
+    
+    src.connect(filter);
+    filter.connect(proc);
+    proc.connect(ctx.destination);
+    processor.current = proc;
+    
+    s.getTracks().forEach(t => t.onended = stop);
+    setRecording(true);
+    
+  } catch (e) {
+    console.error('Start error:', e);
+    setError(e.message || 'Failed');
+    stop();
+  }
+};
 
   return (
     <div className="w-[700px] h-[500px] flex flex-col bg-white font-sans">
-      {/* Header */}
       <div className="bg-gray-800 text-white px-4 py-3 flex justify-between items-center">
         <span className="font-bold text-base">Interview Copilot</span>
         <span className="text-xs text-gray-400">
@@ -143,7 +184,6 @@ export default function App() {
         </span>
       </div>
       
-      {/* Controls */}
       <div className="px-4 py-3 bg-gray-100 border-b flex gap-3 items-center">
         <button
           onClick={recording ? stop : start}
@@ -165,15 +205,12 @@ export default function App() {
         )}
       </div>
 
-      {/* Two Column Layout */}
       <div className="flex-1 flex overflow-hidden">
-        {/* LEFT: Current Q&A */}
         <div className="w-[55%] p-4 border-r bg-gray-50 flex flex-col gap-3 overflow-y-auto">
           <div className="text-xs font-bold text-gray-500 uppercase">
             Current Interview
           </div>
 
-          {/* Question Box */}
           {(currentQ || pendingQuestion.current) ? (
             <div className="p-4 bg-blue-100 rounded-lg border-2 border-blue-500">
               <div className="text-xs font-bold text-blue-800 uppercase mb-2 flex items-center gap-1">
@@ -190,7 +227,6 @@ export default function App() {
             </div>
           )}
           
-          {/* Answer Box */}
           {currentA ? (
             <div className="p-4 bg-green-100 rounded-lg border-2 border-green-500 flex-1 flex flex-col">
               <div className="text-xs font-bold text-green-800 uppercase mb-2 flex items-center gap-1">
@@ -207,7 +243,6 @@ export default function App() {
           ) : null}
         </div>
 
-        {/* RIGHT: History */}
         <div className="w-[45%] p-4 flex flex-col overflow-hidden bg-white">
           <div className="text-xs font-bold text-gray-500 uppercase mb-3 flex justify-between items-center">
             <span>📚 History ({history.length})</span>
@@ -239,9 +274,6 @@ export default function App() {
                     <div className="text-green-700 text-xs leading-relaxed">
                       A: {h.answer}
                     </div>
-                    {/* <div className="text-green-700 text-xs leading-relaxed max-h-32 overflow-y-auto">
-                      A: {h.answer}
-                    </div> */}
                   </div>
                 ))}
                 <div ref={historyEndRef} />
